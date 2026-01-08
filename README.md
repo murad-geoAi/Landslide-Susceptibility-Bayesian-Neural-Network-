@@ -1,0 +1,1 @@
+# Landslide-Susceptibility-Bayesian-Neural-Network-
