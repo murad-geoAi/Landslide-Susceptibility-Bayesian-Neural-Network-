@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger # Import TensorBoard Logger
 import torchmetrics
 
 import pyro
@@ -17,6 +18,7 @@ from pyro.nn import PyroModule, PyroSample
 from pyro.infer import SVI, Trace_ELBO, Predictive
 from pyro.infer.autoguide import AutoNormal
 from pyro.optim import Adam
+import pyro.poutine as poutine
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -26,13 +28,14 @@ from sklearn.datasets import make_classification
 # 1. CONFIGURATION
 # -----------------------------
 class Config:
-    DATA_PATH = "EDA_data.csv"
-    INPUT_DIM = 0 # Will be set dynamically
+    # If file not found, will generate synthetic data
+    DATA_PATH = "/content/EDA_data.csv" 
+    INPUT_DIM = 0 
     HIDDEN_DIM = 64
     BATCH_SIZE = 64
     LR = 1e-3
-    EPOCHS = 50
-    NUM_SAMPLES = 100 # Monte Carlo samples for prediction
+    EPOCHS = 30
+    NUM_SAMPLES = 100 # MC samples for inference
 
 # -----------------------------
 # 2. DATA MODULE
@@ -41,24 +44,36 @@ class LandslideDataModule(pl.LightningDataModule):
     def __init__(self, config):
         super().__init__()
         self.cfg = config
+        self.scaler = StandardScaler()
 
     def setup(self, stage=None):
-        df = pd.read_csv(self.cfg.DATA_PATH)
-        X = df.drop(columns=['Landslide']).values
-        y = df['Landslide'].values
+        # Check if file exists, otherwise generate data
+        if os.path.exists(self.cfg.DATA_PATH):
+            print(f"Loading data from {self.cfg.DATA_PATH}")
+            df = pd.read_csv(self.cfg.DATA_PATH)
+            X = df.drop(columns=['Landslide']).values
+            y = df['Landslide'].values
+        else:
+            print("Warning: Data file not found. Generating SYNTHETIC data for testing.")
+            X, y = make_classification(
+                n_samples=1000, n_features=10, n_informative=8, 
+                n_classes=2, random_state=42
+            )
 
-        # Update input dim based on data
+        # Update input dim dynamically
         self.cfg.INPUT_DIM = X.shape[1]
 
+        # Split
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y
         )
 
-        # Scale data
+        # Scale
         X_train = self.scaler.fit_transform(X_train)
         X_test = self.scaler.transform(X_test)
 
-        # Convert to Tensors
+        # Convert to Tensors (y needs to be float for Bernoulli/BCE usually, but Long for some metrics)
+        # For Pyro Bernoulli obs, float is preferred.
         self.train_data = TensorDataset(
             torch.tensor(X_train, dtype=torch.float32),
             torch.tensor(y_train, dtype=torch.float32)
@@ -83,13 +98,13 @@ class LandslideDataModule(pl.LightningDataModule):
 class BayesianNN(PyroModule):
     def __init__(self, input_dim, hidden_dim=64):
         super().__init__()
-        
-        # Layer 1: Bayesian Linear
+
+        # Layer 1
         self.fc1 = PyroModule[nn.Linear](input_dim, hidden_dim)
         self.fc1.weight = PyroSample(dist.Normal(0., 1.).expand([hidden_dim, input_dim]).to_event(2))
         self.fc1.bias = PyroSample(dist.Normal(0., 1.).expand([hidden_dim]).to_event(1))
 
-        # Layer 2: Bayesian Linear
+        # Layer 2
         self.fc2 = PyroModule[nn.Linear](hidden_dim, hidden_dim // 2)
         self.fc2.weight = PyroSample(dist.Normal(0., 1.).expand([hidden_dim // 2, hidden_dim]).to_event(2))
         self.fc2.bias = PyroSample(dist.Normal(0., 1.).expand([hidden_dim // 2]).to_event(1))
@@ -103,15 +118,15 @@ class BayesianNN(PyroModule):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         
-        # Forward pass gives logits
+        # Logits shape: [batch_size, 1] -> squeeze -> [batch_size]
         logits = self.out(x).squeeze(-1)
-        
-        # Track actual probability for prediction (deterministic site)
-        # This is crucial for retrieving the 'p' values during inference
-        probs = pyro.deterministic("probs", torch.sigmoid(logits))
 
-        # Sampling (Observation)
-        with pyro.plate("data", x.size(0)):
+        # Deterministic site for prediction extraction
+        with pyro.plate("data", x.shape[0]):
+            # Probs is tracked for "Predictive", not used in training
+            probs = pyro.deterministic("probs", torch.sigmoid(logits))
+            
+            # Observation
             obs = pyro.sample("obs", dist.Bernoulli(logits=logits), obs=y)
             
         return logits
@@ -125,12 +140,14 @@ class BNNLightning(pl.LightningModule):
         self.save_hyperparameters()
         self.cfg = config
         
+        # Disable automatic optimization because Pyro SVI handles the step
+        self.automatic_optimization = False 
+
         # Pyro Components
         self.model = BayesianNN(config.INPUT_DIM, config.HIDDEN_DIM)
-        # AutoNormal approximates the posterior as a Normal distribution
-        self.guide = AutoNormal(self.model)
+        # Block 'obs' so the guide doesn't try to predict the target data
+        self.guide = AutoNormal(poutine.block(self.model, hide=['obs']))
         
-        # Loss & Optimizer (Pyro specific)
         self.elbo = Trace_ELBO()
         self.svi = SVI(self.model, self.guide, Adam({"lr": config.LR}), loss=self.elbo)
 
@@ -141,98 +158,116 @@ class BNNLightning(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        # SVI.step performs the forward pass, calculates loss, and updates params
-        # Note: We return the loss value for logging, but PL doesn't do the backprop here.
+        
+        # SVI Step: Calculates loss, gradients, and updates parameters
         loss = self.svi.step(x, y)
-        self.log("train_loss", loss, prog_bar=True)
-        return torch.tensor(loss) # Return tensor for PL compatibility
+        
+        # Convert loss to tensor for logging
+        loss_tensor = torch.tensor(loss)
+        
+        # Log to TensorBoard
+        self.log("train_loss", loss_tensor, on_step=False, on_epoch=True, prog_bar=True)
+        
+        return loss_tensor
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        
-        # Use Predictive to sample from the Guide (Posterior)
-        # We capture "probs" (deterministic site) and "obs" (sampled classes)
+
+        # Posterior Predictive Sampling
         predictive = Predictive(self.model, guide=self.guide, num_samples=20)
         samples = predictive(x)
-        
-        # Average probability across MC samples
+
+        # Mean probability (Monte Carlo integration)
+        # samples['probs'] shape: (20, batch_size) -> mean -> (batch_size)
         mean_probs = samples['probs'].mean(dim=0)
-        
-        # Calculate metrics
-        self.val_acc(mean_probs, y)
-        self.val_auc(mean_probs, y)
-        
-        self.log("val_acc", self.val_acc, prog_bar=True)
-        self.log("val_auc", self.val_auc, prog_bar=True)
+
+        # Reshape to (batch_size, 1) for metrics
+        preds = mean_probs.unsqueeze(1)
+        targets = y.unsqueeze(1).long() # Metrics often prefer Long targets
+
+        # Calculate Metrics
+        self.val_acc(preds, targets)
+        self.val_auc(preds, targets)
+
+        self.log("val_acc", self.val_acc, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val_auc", self.val_auc, on_step=False, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
-        # Important: Pyro manages its own optimizer inside SVI.
-        # We return None to tell Lightning not to manage optimizers.
-        return None 
+        return None  # Pyro handles optimizers internally
 
 # -----------------------------
 # 5. EXECUTION
 # -----------------------------
 if __name__ == "__main__":
-    # Clear Pyro param store to prevent overlap in interactive sessions
+    # Clear Pyro param store
     pyro.clear_param_store()
     pl.seed_everything(42)
 
     # 1. Setup Data
     conf = Config()
     dm = LandslideDataModule(conf)
-    dm.prepare_data() 
+    dm.prepare_data()
     dm.setup()
     
     # 2. Setup Model
+    # Re-init config with dynamic Input Dim from DataModule
+    conf.INPUT_DIM = dm.cfg.INPUT_DIM 
     model = BNNLightning(conf)
 
-    # 3. Trainer
-    checkpoint_callback = ModelCheckpoint(monitor="val_auc", mode="max")
+    # 3. TensorBoard Logger
+    logger = TensorBoardLogger("tb_logs", name="landslide_bnn")
+
+    # 4. Trainer
+    checkpoint_callback = ModelCheckpoint(monitor="val_auc", mode="max", filename='best-checkpoint')
+    
     trainer = pl.Trainer(
         max_epochs=conf.EPOCHS,
-        accelerator="auto", # auto-detect GPU/CPU
+        accelerator="auto", 
         devices="auto",
         callbacks=[checkpoint_callback],
-        log_every_n_steps=10,
+        logger=logger, # Attach Logger
+        log_every_n_steps=5,
         enable_progress_bar=True
     )
 
     print("--- Starting Training (Variational Inference) ---")
     trainer.fit(model, dm)
 
-    # 4. Uncertainty Estimation (Inference)
-    print("\n--- Running Uncertainty Evaluation ---")
+    # 5. Inference / Uncertainty Estimation
+    print("\n--- Running Uncertainty Evaluation on Test Set ---")
     
-    # Get test data
+    # Load best model
+    best_model_path = checkpoint_callback.best_model_path
+    if best_model_path:
+        print(f"Loading best model from: {best_model_path}")
+        # Note: We load state_dict into the Pyro param store logic usually, 
+        # but PL handles loading the module weights. 
+        # For Pyro, params are in the global store, so we just use the trained model.
+        pass
+
     test_loader = dm.test_dataloader()
-    X_test, y_test = next(iter(test_loader)) # Get one batch for demo
-    
-    # We use the trained guide to make predictions
+    X_test, y_test = next(iter(test_loader))
+
+    # Predictive Mode
     predictive = Predictive(model.model, guide=model.guide, num_samples=conf.NUM_SAMPLES)
     samples = predictive(X_test)
-    
-    # Extract Probabilities
-    # samples['probs'] shape: (num_samples, batch_size)
+
+    # samples['probs']: (num_samples, batch_size)
     y_pred_prob_samples = samples['probs']
-    
-    # Mean Prediction (Point Estimate)
+
+    # 1. Mean Prediction
     y_pred_mean = y_pred_prob_samples.mean(dim=0)
     
-    # Uncertainty (Standard Deviation of the posterior predictive)
+    # 2. Uncertainty (Standard Deviation)
     uncertainty = y_pred_prob_samples.std(dim=0)
 
-    # Metrics on this batch
-    preds_binary = (y_pred_mean > 0.5).float()
-    acc = torchmetrics.functional.accuracy(preds_binary, y_test, task="binary")
-    
-    print(f"Test Batch Accuracy: {acc:.4f}")
-    
-    # Show Uncertainty Examples
-    print("\nExamples of Uncertainty:")
-    print(f"{'True Label':<10} | {'Pred Prob':<10} | {'Uncertainty (StdDev)':<20} | {'Confidence'}")
-    print("-" * 65)
-    
-    for i in range(10):
-        confidence = "HIGH" if uncertainty[i] < 0.1 else ("MED" if uncertainty[i] < 0.2 else "LOW")
-        print(f"{int(y_test[i]):<10} | {y_pred_mean[i]:.4f}     | {uncertainty[i]:.4f}               | {confidence}")
+    # Display Results
+    print(f"\n{'True':<5} | {'Pred':<10} | {'Uncertainty':<12} | {'Confidence'}")
+    print("-" * 50)
+
+    for i in range(min(15, len(y_test))):
+        conf_level = "HIGH" if uncertainty[i] < 0.1 else ("MED" if uncertainty[i] < 0.2 else "LOW")
+        print(f"{int(y_test[i]):<5} | {y_pred_mean[i]:.4f}     | {uncertainty[i]:.4f}       | {conf_level}")
+
+    print("\nTo view TensorBoard, run in terminal:")
+    print("tensorboard --logdir tb_logs")
